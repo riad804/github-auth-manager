@@ -81,6 +81,10 @@ func getHostFromURL(remoteURL string) (string, error) {
 // ExecuteGitCommandWithContext wraps a git command, injecting context-specific credentials.
 // Takes io.Writer for stdout and stderr for better testability and control.
 func ExecuteGitCommandWithContext(gitArgs []string, outW, errW io.Writer) error {
+	if len(gitArgs) == 0 {
+		return fmt.Errorf("no git command provided")
+	}
+
 	cwd, err := os.Getwd()
 	if err != nil {
 		return fmt.Errorf("failed to get current working directory: %w", err)
@@ -113,7 +117,7 @@ func ExecuteGitCommandWithContext(gitArgs []string, outW, errW io.Writer) error 
 		}
 	}
 
-	cmdArgs := []string{}
+	cmdArgs := make([]string, 0, len(gitArgs)+4) // Pre-allocate with some extra capacity
 	envVars := os.Environ()
 
 	if activeContext != nil && token != "" {
@@ -124,32 +128,41 @@ func ExecuteGitCommandWithContext(gitArgs []string, outW, errW io.Writer) error 
 			cmdArgs = append(cmdArgs, "-c", fmt.Sprintf("user.email=%s", activeContext.Email))
 		}
 
-		if len(gitArgs) > 1 && gitArgs[0] == "clone" {
-			origURL := gitArgs[1]
-			if strings.HasPrefix(origURL, "https://") {
-				u, err := url.Parse(origURL)
-				if err == nil {
-					u.User = url.UserPassword(activeContext.Username, token)
-					gitArgs[1] = u.String()
-				}
-			}
-		} else if isInsideRepo && (gitArgs[0] == "pull" || gitArgs[0] == "push" || gitArgs[0] == "fetch") {
-			originURLCmd := exec.Command("git", "config", "--get", "remote.origin.url")
-			originURLCmd.Dir = repoRoot
-			if output, err := originURLCmd.Output(); err == nil {
-				remoteOriginURL := strings.TrimSpace(string(output))
-				if strings.HasPrefix(remoteOriginURL, "https://") {
-					u, err := url.Parse(remoteOriginURL)
+		command := gitArgs[0]
+		switch command {
+		case "clone":
+			if len(gitArgs) > 1 {
+				origURL := gitArgs[1]
+				if strings.HasPrefix(origURL, "https://") {
+					u, err := url.Parse(origURL)
 					if err == nil {
 						u.User = url.UserPassword(activeContext.Username, token)
-						tempRemote := u.String()
-						cmdArgs = append(cmdArgs, "-c", fmt.Sprintf("remote.origin.url=%s", tempRemote))
+						gitArgs[1] = u.String()
+					}
+				}
+			}
+		case "pull", "push", "fetch":
+			if isInsideRepo {
+				originURLCmd := exec.Command("git", "config", "--get", "remote.origin.url")
+				originURLCmd.Dir = repoRoot
+				output, err := originURLCmd.Output()
+				if err == nil {
+					remoteOriginURL := strings.TrimSpace(string(output))
+					if strings.HasPrefix(remoteOriginURL, "https://") {
+						u, err := url.Parse(remoteOriginURL)
+						if err == nil {
+							u.User = url.UserPassword(activeContext.Username, token)
+							tempRemote := u.String()
+							cmdArgs = append(cmdArgs, "-c", fmt.Sprintf("remote.origin.url=%s", tempRemote))
+						}
 					}
 				}
 			}
 		}
 
-		fmt.Fprintf(errW, "[GHAM] Using token from context '%s' for GitHub operations.\n", contextName)
+		if contextName != "" {
+			fmt.Fprintf(errW, "[GHAM] Using token from context '%s' for GitHub operations.\n", contextName)
+		}
 	}
 
 	cmdArgs = append(cmdArgs, gitArgs...)
@@ -169,7 +182,7 @@ func ExecuteGitCommandWithContext(gitArgs []string, outW, errW io.Writer) error 
 	err = gitCommand.Run()
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
-			return fmt.Errorf("git command failed: %s", exitErr.Error())
+			return fmt.Errorf("git command failed with exit code %d: %s", exitErr.ExitCode(), exitErr.Stderr)
 		}
 		return fmt.Errorf("failed to execute git command: %w", err)
 	}

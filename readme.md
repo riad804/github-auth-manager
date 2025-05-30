@@ -132,5 +132,5 @@ Please follow conventional commit guidelines and write tests for new features wh
 
 Built with ❤️ by developers for developers.
 ```bash
-Let me know if you'd like to include badges (build status, license, Go report card), add a `CONTRIBUTING.md` file, or turn this into a template for your GitHub repo automatically.
+Let me know if you would like to include badges (build status, license, Go report card), add a `CONTRIBUTING.md` file, or turn this into a template for your GitHub repo automatically.
 ```

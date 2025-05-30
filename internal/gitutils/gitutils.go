@@ -11,7 +11,15 @@ import (
 
 	"github.com/riad804/github-auth-manager/internal/config"
 	"github.com/riad804/github-auth-manager/internal/keyring"
+
+	"github.com/go-git/go-git/v5"
+	gc "github.com/go-git/go-git/v5/config"
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/transport/http"
 )
+
+// var activeContext *Context
+// var token string
 
 // FindRepoRoot traverses up from the given path to find a .git directory.
 // Returns the absolute path to the directory containing .git, or an error if not found.
@@ -89,7 +97,7 @@ func ExecuteGitCommandWithContext(gitArgs []string, outW, errW io.Writer) error 
 	if err != nil {
 		return fmt.Errorf("failed to get current working directory: %w", err)
 	}
-
+	command := gitArgs[0]
 	var activeContext *config.Context
 	var token string
 	var contextName string
@@ -117,10 +125,35 @@ func ExecuteGitCommandWithContext(gitArgs []string, outW, errW io.Writer) error 
 		}
 	}
 
-	cmdArgs := make([]string, 0, len(gitArgs)+4) // Pre-allocate with some extra capacity
+	if isInsideRepo && activeContext != nil && token != "" {
+		switch command {
+		case "pull":
+			return handlePullWithGoGit(repoRoot, gitArgs, activeContext, token, outW, errW)
+		case "push":
+			return handlePushWithGoGit(repoRoot, gitArgs, activeContext, token, outW, errW)
+		case "fetch":
+			return handleFetchWithGoGit(repoRoot, gitArgs, activeContext, token, outW, errW)
+		}
+	}
+
+	if contextName != "" {
+		fmt.Fprintf(errW, "[GHAM] Using token from context '%s' for GitHub operations.\n", contextName)
+	}
+
+	// For other commands (including clone), use the original exec-based approach
+	return executeWithOSCommand(gitArgs, cwd, repoRoot, isInsideRepo, outW, errW, activeContext, token)
+}
+
+// executeWithOSCommand handles non go-git commands using OS exec
+func executeWithOSCommand(gitArgs []string, cwd, repoRoot string, isInsideRepo bool, outW, errW io.Writer, activeContext *config.Context, token string) error {
+	cmdArgs := []string{}
 	envVars := os.Environ()
 
 	if activeContext != nil && token != "" {
+		// Disable credential helpers
+		cmdArgs = append(cmdArgs, "-c", "credential.helper=")
+
+		// Set user config if provided
 		if activeContext.Username != "" && activeContext.Username != config.DefaultUserName {
 			cmdArgs = append(cmdArgs, "-c", fmt.Sprintf("user.name=%s", activeContext.Username))
 		}
@@ -128,45 +161,27 @@ func ExecuteGitCommandWithContext(gitArgs []string, outW, errW io.Writer) error 
 			cmdArgs = append(cmdArgs, "-c", fmt.Sprintf("user.email=%s", activeContext.Email))
 		}
 
-		command := gitArgs[0]
-		switch command {
-		case "clone":
-			if len(gitArgs) > 1 {
-				origURL := gitArgs[1]
-				if strings.HasPrefix(origURL, "https://") {
-					u, err := url.Parse(origURL)
-					if err == nil {
-						u.User = url.UserPassword(activeContext.Username, token)
-						gitArgs[1] = u.String()
-					}
+		// Handle clone command separately
+		if len(gitArgs) > 1 && gitArgs[0] == "clone" {
+			origURL := gitArgs[1]
+			// Convert SSH URLs to HTTPS
+			if strings.HasPrefix(origURL, "git@") {
+				origURL = convertSSHtoHTTPS(origURL)
+			}
+			if strings.HasPrefix(origURL, "https://") {
+				u, err := url.Parse(origURL)
+				if err != nil {
+					fmt.Fprintf(errW, "Warning: failed to parse URL %s: %v\n", origURL, err)
+				} else {
+					u.User = url.UserPassword(activeContext.Username, token)
+					gitArgs[1] = u.String()
+					fmt.Fprintf(errW, "[GHAM] Using authenticated URL: %s\n", u.Redacted())
 				}
 			}
-		case "pull", "push", "fetch":
-			if isInsideRepo {
-				originURLCmd := exec.Command("git", "config", "--get", "remote.origin.url")
-				originURLCmd.Dir = repoRoot
-				output, err := originURLCmd.Output()
-				if err == nil {
-					remoteOriginURL := strings.TrimSpace(string(output))
-					if strings.HasPrefix(remoteOriginURL, "https://") {
-						u, err := url.Parse(remoteOriginURL)
-						if err == nil {
-							u.User = url.UserPassword(activeContext.Username, token)
-							tempRemote := u.String()
-							cmdArgs = append(cmdArgs, "-c", fmt.Sprintf("remote.origin.url=%s", tempRemote))
-						}
-					}
-				}
-			}
-		}
-
-		if contextName != "" {
-			fmt.Fprintf(errW, "[GHAM] Using token from context '%s' for GitHub operations.\n", contextName)
 		}
 	}
 
 	cmdArgs = append(cmdArgs, gitArgs...)
-
 	gitCommand := exec.Command("git", cmdArgs...)
 	gitCommand.Env = envVars
 	gitCommand.Stdin = os.Stdin
@@ -179,13 +194,106 @@ func ExecuteGitCommandWithContext(gitArgs []string, outW, errW io.Writer) error 
 		gitCommand.Dir = cwd
 	}
 
-	err = gitCommand.Run()
+	return gitCommand.Run()
+}
+
+func handlePullWithGoGit(repoRoot string, gitArgs []string, ctx *config.Context, token string, outW, errW io.Writer) error {
+	repo, err := git.PlainOpen(repoRoot)
 	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			return fmt.Errorf("git command failed with exit code %d: %s", exitErr.ExitCode(), exitErr.Stderr)
-		}
-		return fmt.Errorf("failed to execute git command: %w", err)
+		return fmt.Errorf("failed to open repository: %w", err)
 	}
 
-	return nil
+	w, err := repo.Worktree()
+	if err != nil {
+		return fmt.Errorf("failed to get worktree: %w", err)
+	}
+
+	auth := &http.BasicAuth{
+		Username: ctx.Username,
+		Password: token,
+	}
+
+	opts := &git.PullOptions{
+		RemoteName: "origin",
+		Auth:       auth,
+		Progress:   outW,
+	}
+
+	// Handle branch specification if provided
+	if len(gitArgs) > 1 {
+		for i, arg := range gitArgs[1:] {
+			if arg == "-b" || arg == "--branch" {
+				if i+1 < len(gitArgs[1:]) {
+					branch := gitArgs[i+2]
+					opts.ReferenceName = plumbing.ReferenceName("refs/heads/" + branch)
+				}
+			}
+		}
+	}
+
+	fmt.Fprintf(errW, "[GHAM] Pulling with token from context '%s'\n", ctx.Name)
+	return w.Pull(opts)
+}
+
+func handlePushWithGoGit(repoRoot string, gitArgs []string, ctx *config.Context, token string, outW, errW io.Writer) error {
+	repo, err := git.PlainOpen(repoRoot)
+	if err != nil {
+		return fmt.Errorf("failed to open repository: %w", err)
+	}
+
+	auth := &http.BasicAuth{
+		Username: ctx.Username,
+		Password: token,
+	}
+
+	opts := &git.PushOptions{
+		RemoteName: "origin",
+		Auth:       auth,
+		Progress:   outW,
+	}
+
+	// Handle branch specification
+	if len(gitArgs) > 1 {
+		refSpecs := []gc.RefSpec{}
+		for _, arg := range gitArgs[1:] {
+			if !strings.HasPrefix(arg, "-") && arg != "origin" {
+				refSpecs = append(refSpecs, gc.RefSpec("refs/heads/"+arg+":refs/heads/"+arg))
+			}
+		}
+		if len(refSpecs) > 0 {
+			opts.RefSpecs = refSpecs
+		}
+	}
+
+	fmt.Fprintf(errW, "[GHAM] Pushing with token from context '%s'\n", ctx.Name)
+	return repo.Push(opts)
+}
+
+func handleFetchWithGoGit(repoRoot string, gitArgs []string, ctx *config.Context, token string, outW, errW io.Writer) error {
+	repo, err := git.PlainOpen(repoRoot)
+	if err != nil {
+		return fmt.Errorf("failed to open repository: %w", err)
+	}
+
+	auth := &http.BasicAuth{
+		Username: ctx.Username,
+		Password: token,
+	}
+
+	opts := &git.FetchOptions{
+		RemoteName: "origin",
+		Auth:       auth,
+		Progress:   outW,
+	}
+
+	fmt.Fprintf(errW, "[GHAM] Fetching with token from context '%s'\n", ctx.Name)
+	return repo.Fetch(opts)
+}
+
+// Helper functions
+func convertSSHtoHTTPS(sshURL string) string {
+	return strings.NewReplacer(
+		"git@github.com:", "https://github.com/",
+		".git", "",
+	).Replace(sshURL) + ".git"
 }

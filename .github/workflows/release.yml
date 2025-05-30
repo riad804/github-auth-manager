@@ -1,0 +1,85 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v1.0.0' # Matches tags like v1.0.0, v2.1.3, etc.
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Needed to create releases
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.24.2'
+          
+      - name: Get tag version
+        id: tag
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+        
+      - name: Build binaries
+        run: |
+          mkdir -p release
+          
+          # List of target platforms (OS/ARCH)
+          platforms=(
+            "linux/amd64"
+            "linux/arm64"
+            "darwin/amd64"
+            "darwin/arm64"
+            "windows/amd64"
+          )
+          
+          for platform in "${platforms[@]}"; do
+            platform_split=(${platform//\// })
+            GOOS=${platform_split[0]}
+            GOARCH=${platform_split[1]}
+            
+            output_name="gham-$VERSION-$GOOS-$GOARCH"
+            
+            if [ "$GOOS" = "windows" ]; then
+              output_name+='.exe'
+            fi
+            
+            echo "Building $output_name"
+            CGO_ENABLED=1 GOOS=$GOOS GOARCH=$GOARCH go build \
+              -ldflags="-X main.AppVersion=$VERSION" \
+              -o "release/$output_name" .
+              
+            # Generate checksums
+            sha256sum "release/$output_name" > "release/$output_name.sha256"
+          done
+          
+      - name: Create release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ env.VERSION }}
+          name: ${{ env.VERSION }}
+          body: |
+            ## GHAM ${{ env.VERSION }}
+            
+            ### Installation
+            
+            #### Download binaries
+            Download the appropriate binary for your system from the assets below.
+            
+            #### Homebrew (coming soon)
+            ```bash
+            brew install yourusername/tap/gham
+            ```
+            
+            #### Via Go
+            ```bash
+            go install github.com/yourusername/gham@${{ env.VERSION }}
+            ```
+          files: |
+            release/gham-${{ env.VERSION }}-*
+          draft: false
+          prerelease: ${{ contains(env.VERSION, '-') }} # Mark as prerelease if version contains '-'

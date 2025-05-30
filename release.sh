@@ -1,41 +1,43 @@
 #!/bin/bash
-set -euo pipefail
 
-# Get version from first argument or use git tag
-VERSION=${1:-$(git describe --tags --abbrev=0)}
+set -e
+
+APP_NAME="gham"  # Change this to your CLI tool name
+VERSION="$1"
+
 if [ -z "$VERSION" ]; then
-  echo "Error: No version specified and no git tag found"
+  echo "❌ Error: Version not provided."
+  echo "Usage: ./release.sh v1.0.0"
   exit 1
 fi
 
-echo "Building GHAM version $VERSION"
-mkdir -p release/$VERSION
+DIST_DIR="dist/$VERSION"
 
-platforms=(
+# List of target OS/ARCH combinations
+targets=(
   "linux/amd64"
   "linux/arm64"
   "darwin/amd64"
   "darwin/arm64"
   "windows/amd64"
+  "windows/arm64"
 )
 
-for platform in "${platforms[@]}"; do
-  platform_split=(${platform//\// })
-  GOOS=${platform_split[0]}
-  GOARCH=${platform_split[1]}
-  output_name="gham-$VERSION-$GOOS-$GOARCH"
-  
-  if [ "$GOOS" = "windows" ]; then
-    output_name+='.exe'
-  fi
+# Clean old build
+rm -rf "$DIST_DIR"
+mkdir -p "$DIST_DIR"
 
-  echo "Building $output_name"
-  CGO_ENABLED=1 GOOS=$GOOS GOARCH=$GOARCH go build \
-    -ldflags="-X main.AppVersion=$VERSION" \
-    -o "release/$VERSION/$output_name" .
-  
-  # Generate checksums
-  sha256sum "release/$VERSION/$output_name" > "release/$VERSION/$output_name.sha256"
+echo "🚀 Building $APP_NAME version $VERSION for multiple platforms..."
+
+for target in "${targets[@]}"; do
+  IFS="/" read -r GOOS GOARCH <<< "$target"
+  output_name="${APP_NAME}-${VERSION}-${GOOS}-${GOARCH}"
+  [ "$GOOS" = "windows" ] && output_name+=".exe"
+
+  echo "-> Building for $GOOS/$GOARCH..."
+
+  env GOOS=$GOOS GOARCH=$GOARCH CGO_ENABLED=0 go build -ldflags="-s -w -X main.version=$VERSION" -o "$DIST_DIR/$output_name" .
+
 done
 
-echo "Build complete. Files saved to release/$VERSION/"
+echo "✅ Builds completed in '$DIST_DIR'."

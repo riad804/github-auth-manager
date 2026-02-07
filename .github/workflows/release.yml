@@ -3,34 +3,31 @@ name: Release
 on:
   push:
     tags:
-      - "v*"
+      - 'v*'               # v1.0.0, v0.5.3-beta.2, etc.
 
 permissions:
-  contents: write
+  contents: write        # to create releases & upload assets
 
 jobs:
   release:
-    name: Build & Release
-    runs-on: macos-latest   # Required for macOS universal binaries
+    runs-on: ubuntu-latest   # ← best choice (fast & cheap)
 
     steps:
-      - name: Checkout
+      - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # Required by GoReleaser
+          fetch-depth: 0     # important for correct changelog & tag detection
 
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version: '1.22'   # or '1.23' — match your go.mod
 
-      - name: Install GoReleaser
+      - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6
         with:
           distribution: goreleaser
-          version: latest
-
-      - name: Run GoReleaser
+          version: '~> v2'          # or 'latest' — '~> v2' is safer
+          args: release --clean     # ← this is the correct place
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: goreleaser release --clean

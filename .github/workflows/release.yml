@@ -28,6 +28,6 @@ jobs:
         with:
           distribution: goreleaser
           version: '~> v2'          # or 'latest' — '~> v2' is safer
-          args: release --clean     # ← this is the correct place
+          args: release --snapshot --clean     # ← this is the correct place
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -10,24 +10,79 @@ permissions:
 
 jobs:
   release:
-    runs-on: ubuntu-latest   # ← best choice (fast & cheap)
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            artifact_name: gham-linux-amd64
+          - os: macos-latest
+            goos: darwin
+            goarch: arm64
+            artifact_name: gham-macos-arm64
+          - os: macos-latest
+            goos: darwin
+            goarch: amd64
+            artifact_name: gham-macos-amd64
+          - os: windows-latest
+            goos: windows
+            goarch: amd64
+            artifact_name: gham-windows-amd64.exe
+
+    runs-on: ${{ matrix.os }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0     # important for correct changelog & tag detection
+          fetch-depth: 0
 
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'   # or '1.23' — match your go.mod
+          go-version: '1.25'
 
-      - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v6
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          go build -o ${{ matrix.artifact_name }} ./cmd
+
+      - name: Create macOS universal binary (on macOS runner)
+        if: matrix.os == 'macos-latest' && matrix.goarch == 'amd64'
+        run: |
+          # Build arm64 if we're on amd64 step and have both
+          GOOS=darwin GOARCH=arm64 go build -o gham-macos-arm64 ./cmd
+          GOOS=darwin GOARCH=amd64 go build -o gham-macos-amd64 ./cmd
+          lipo -create -output gham-macos-universal gham-macos-arm64 gham-macos-amd64
+          ls -lh gham-macos-*
+
+      - name: Upload release asset
+        uses: actions/upload-artifact@v4
         with:
-          distribution: goreleaser
-          version: '~> v2'          # or 'latest' — '~> v2' is safer
-          args: release --snapshot --clean     # ← this is the correct place
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_name }}
+
+  publish:
+    needs: release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: gham-*/*
+          draft: false
+          prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

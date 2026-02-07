@@ -1,0 +1,44 @@
+# Binaries for programs and plugins
+/bin
+/bin/
+/*.exe
+/*.dll
+/*.so
+/*.dylib
+
+# Test binaries
+/*.test
+
+# Output of the go coverage tool
+coverage.out
+
+# Dependency directories (remove the comment below to include vendor)
+/vendor/
+
+# IDEs and editors
+.vscode/
+.idea/
+*.iml
+
+# macOS
+.DS_Store
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Build directories
+dist/
+
+# Go modules cache (not in repo, just in case)
+GOMODCACHE
+
+# Local config used by the app
+# (Do NOT ignore global ~/.config/git-auth-manager)
+.git-auth-manager.json
+
+# Sensitive keys
+*.key
+*.pem
+

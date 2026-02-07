@@ -1,0 +1,59 @@
+# goreleaser release --snapshot --clean 
+version: 2
+project_name: gham
+
+builds:
+  - id: gham
+    env:
+      - CGO_ENABLED=0
+    main: ./cmd/main.go
+    binary: gham
+    goos:
+      - darwin
+      - linux
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.AppVersion={{.Version}}
+
+universal_binaries:
+  - id: gham-universal
+    ids:
+      - gham
+    name_template: "{{ .ProjectName }}_{{ .Version }}_darwin_universal"
+    replace: true
+
+archives:
+  - id: nix
+    ids:
+      - gham
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats:
+      - tar.gz
+    allow_different_binary_count: true
+
+  - id: windows
+    ids:
+      - gham
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats:
+      - zip
+    allow_different_binary_count: true
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^ci:'
+      - '^chore:'
+      - '^refactor:'
+      - '^style:'
+      - '^Merge pull request'

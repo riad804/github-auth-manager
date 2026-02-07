@@ -33,28 +33,41 @@ func PerformOAuth(provider Provider) (*models.Token, error) {
 	verifier := generateRandomString(43) // 128 bits entropy
 	challenge := base64URLEncode(sha256.Sum256([]byte(verifier)))
 
+	// Use fixed port for callback
+	const port = "1236"
+	redirectURI := "http://127.0.0.1:" + port + "/callback"
+
 	// Start local server
-	_, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	codeChan := make(chan string, 1)
 	errChan := make(chan error, 1)
 
-	server := &http.Server{Addr: "127.0.0.1:0"} // Random port
+	server := &http.Server{
+		Addr: "127.0.0.1:" + port,
+		BaseContext: func(l net.Listener) context.Context {
+			return ctx
+		},
+	}
+
 	http.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("state") != state {
 			errChan <- fmt.Errorf("state mismatch")
+			http.Error(w, "state mismatch", http.StatusBadRequest)
 			return
 		}
 		code := r.URL.Query().Get("code")
 		if code == "" {
-			errChan <- fmt.Errorf("no code")
+			errChan <- fmt.Errorf("no code in response")
+			http.Error(w, "no code", http.StatusBadRequest)
 			return
 		}
 		codeChan <- code
 		fmt.Fprint(w, "Login successful. You can close this tab.")
-		go func() { // Shutdown after response
-			time.Sleep(1 * time.Second)
-			cancel()
+		// Shutdown server after sending response
+		go func() {
+			time.Sleep(500 * time.Millisecond)
+			server.Shutdown(context.Background())
 		}()
 	})
 
@@ -64,13 +77,8 @@ func PerformOAuth(provider Provider) (*models.Token, error) {
 		}
 	}()
 
-	// Get port
-	listener, _ := net.Listen("tcp", "127.0.0.1:0")
-	strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)
-	listener.Close() // Temp to get port, but actual use random each time? No, use fixed 8080 for simplicity, but to avoid conflict, random.
-	// For code, use fixed 8080, assume free.
-	server.Addr = "127.0.0.1:1236"
-	redirectURI := "http://127.0.0.1:1236/callback"
+	// Give server time to start listening
+	time.Sleep(100 * time.Millisecond)
 
 	// Build auth URL
 	authParams := url.Values{
@@ -93,9 +101,13 @@ func PerformOAuth(provider Provider) (*models.Token, error) {
 	// Wait for code or error
 	select {
 	case code := <-codeChan:
-		// Exchange
+		// Close server
+		server.Shutdown(context.Background())
+
+		// Exchange code for token
 		tokenParams := url.Values{
 			"client_id":     {provider.ClientID},
+			"client_secret": {provider.ClientSecret}, // Required by GitHub
 			"code":          {code},
 			"grant_type":    {"authorization_code"},
 			"redirect_uri":  {redirectURI},
@@ -103,12 +115,12 @@ func PerformOAuth(provider Provider) (*models.Token, error) {
 		}
 		resp, err := http.PostForm(provider.TokenURL, tokenParams)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("token exchange failed: %w", err)
 		}
 		defer resp.Body.Close()
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("read token response failed: %w", err)
 		}
 
 		var token models.Token
@@ -124,11 +136,17 @@ func PerformOAuth(provider Provider) (*models.Token, error) {
 				token.Expiry = time.Now().Add(time.Duration(expiresIn) * time.Second)
 			}
 		}
+
+		if token.AccessToken == "" {
+			return nil, fmt.Errorf("no access token in response: %s", string(body))
+		}
 		return &token, nil
 	case err := <-errChan:
+		server.Shutdown(context.Background())
 		return nil, err
 	case <-time.After(5 * time.Minute):
-		return nil, fmt.Errorf("timeout")
+		server.Shutdown(context.Background())
+		return nil, fmt.Errorf("OAuth timeout")
 	}
 }
 

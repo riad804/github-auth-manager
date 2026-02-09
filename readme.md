@@ -12,6 +12,36 @@ Features
 - OAuth-based login for providers (tokens stored in OS keyring)
 - Commands: `login`, `logout`, `accounts`, `link`, `unlink`, `status`, `doctor`, `credential`
 
+Installation
+
+Download the latest release for your platform from [GitHub Releases](https://github.com/riad804/auth-manager/releases).
+
+### macOS
+```bash
+# Download the latest macOS binary
+# Extract and move to PATH
+tar -xzf gham-darwin-*.tar.gz
+chmod +x gham
+sudo mv gham /usr/local/bin/
+xattr -d com.apple.quarantine /usr/local/bin/gham
+```
+
+### Linux
+```bash
+# Download the latest Linux binary
+# Extract and move to PATH
+tar -xzf gham-linux-*.tar.gz
+chmod +x gham
+sudo mv gham /usr/local/bin/
+```
+
+### Windows
+```bash
+# Download the latest Windows binary (.exe)
+# Extract and add to PATH or use directly
+# E.g., move to C:\Program Files\gham\
+```
+
 Quickstart
 1. Build:
 

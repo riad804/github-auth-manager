@@ -20,53 +20,109 @@ import (
 
 	"github.com/riad804/auth-manager/internals/models"
 	"github.com/riad804/auth-manager/internals/storage"
-	_ "golang.org/x/crypto/pbkdf2"
 )
 
 // mutex for token access
 var tokenMutex = &sync.Mutex{}
 
-// PerformOAuth handles the full OAuth flow
+// ==========================
+// PKCE helpers (RFC 7636)
+// ==========================
+
+func generateCodeVerifier() (string, error) {
+	const length = 64 // MUST be 43–128
+
+	const charset = "abcdefghijklmnopqrstuvwxyz" +
+		"ABCDEFGHIJKLMNOPQRSTUVWXYZ" +
+		"0123456789-._~"
+
+	b := make([]byte, length)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+
+	for i := range b {
+		b[i] = charset[int(b[i])%len(charset)]
+	}
+
+	return string(b), nil
+}
+
+func generateCodeChallenge(verifier string) string {
+	hash := sha256.Sum256([]byte(verifier))
+	return base64.RawURLEncoding.EncodeToString(hash[:])
+}
+
+func generateState() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+// ==========================
+// OAuth flow
+// ==========================
+
 func PerformOAuth(provider Provider) (*models.Token, error) {
-	// Generate state and verifier
-	state := generateRandomString(16)
-	verifier := generateRandomString(43) // 128 bits entropy
-	challenge := base64URLEncode(sha256.Sum256([]byte(verifier)))
+	state, err := generateState()
+	if err != nil {
+		return nil, err
+	}
 
-	// Use fixed port for callback
-	const port = "1236"
-	redirectURI := "http://127.0.0.1:" + port + "/callback"
+	verifier, err := generateCodeVerifier()
+	if err != nil {
+		return nil, err
+	}
 
-	// Start local server
+	challenge := generateCodeChallenge(verifier)
+
+	// Get random free port
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, err
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	listener.Close()
+
+	redirectURI := fmt.Sprintf("http://127.0.0.1:%d/callback", port)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
 	codeChan := make(chan string, 1)
 	errChan := make(chan error, 1)
 
+	mux := http.NewServeMux()
+
 	server := &http.Server{
-		Addr: "127.0.0.1:" + port,
-		BaseContext: func(l net.Listener) context.Context {
+		Addr:    fmt.Sprintf("127.0.0.1:%d", port),
+		Handler: mux,
+		BaseContext: func(net.Listener) context.Context {
 			return ctx
 		},
 	}
 
-	http.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("state") != state {
-			errChan <- fmt.Errorf("state mismatch")
 			http.Error(w, "state mismatch", http.StatusBadRequest)
+			errChan <- fmt.Errorf("state mismatch")
 			return
 		}
+
 		code := r.URL.Query().Get("code")
 		if code == "" {
+			http.Error(w, "missing code", http.StatusBadRequest)
 			errChan <- fmt.Errorf("no code in response")
-			http.Error(w, "no code", http.StatusBadRequest)
 			return
 		}
-		codeChan <- code
+
 		fmt.Fprint(w, "Login successful. You can close this tab.")
-		// Shutdown server after sending response
+		codeChan <- code
+
 		go func() {
-			time.Sleep(500 * time.Millisecond)
+			time.Sleep(300 * time.Millisecond)
 			server.Shutdown(context.Background())
 		}()
 	})
@@ -77,10 +133,6 @@ func PerformOAuth(provider Provider) (*models.Token, error) {
 		}
 	}()
 
-	// Give server time to start listening
-	time.Sleep(100 * time.Millisecond)
-
-	// Build auth URL
 	authParams := url.Values{
 		"client_id":             {provider.ClientID},
 		"redirect_uri":          {redirectURI},
@@ -90,64 +142,137 @@ func PerformOAuth(provider Provider) (*models.Token, error) {
 		"code_challenge":        {challenge},
 		"code_challenge_method": {"S256"},
 	}
+
 	authURL := provider.AuthURL + "?" + authParams.Encode()
 
-	// Open browser
-	err := openBrowser(authURL)
-	if err != nil {
+	if err := openBrowser(authURL); err != nil {
 		return nil, err
 	}
 
-	// Wait for code or error
 	select {
 	case code := <-codeChan:
-		// Close server
-		server.Shutdown(context.Background())
-
-		// Exchange code for token
 		tokenParams := url.Values{
 			"client_id":     {provider.ClientID},
-			"client_secret": {provider.ClientSecret}, // Required by GitHub
 			"code":          {code},
 			"grant_type":    {"authorization_code"},
 			"redirect_uri":  {redirectURI},
 			"code_verifier": {verifier},
 		}
-		resp, err := http.PostForm(provider.TokenURL, tokenParams)
-		if err != nil {
-			return nil, fmt.Errorf("token exchange failed: %w", err)
-		}
-		defer resp.Body.Close()
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return nil, fmt.Errorf("read token response failed: %w", err)
+
+		// GitHub still allows client_secret for classic OAuth apps
+		if provider.ClientSecret != "" {
+			tokenParams.Set("client_secret", provider.ClientSecret)
 		}
 
-		var token models.Token
-		err = json.Unmarshal(body, &token)
+		req, _ := http.NewRequest("POST", provider.TokenURL, strings.NewReader(tokenParams.Encode()))
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
-			// For GitHub, it's form encoded
+			return nil, err
+		}
+		defer resp.Body.Close()
+
+		body, _ := io.ReadAll(resp.Body)
+
+		var token models.Token
+		if err := json.Unmarshal(body, &token); err != nil {
 			values, _ := url.ParseQuery(string(body))
 			token.AccessToken = values.Get("access_token")
 			token.RefreshToken = values.Get("refresh_token")
 			token.TokenType = values.Get("token_type")
-			expiresIn, _ := strconv.Atoi(values.Get("expires_in"))
-			if expiresIn > 0 {
-				token.Expiry = time.Now().Add(time.Duration(expiresIn) * time.Second)
+			if exp, _ := strconv.Atoi(values.Get("expires_in")); exp > 0 {
+				token.Expiry = time.Now().Add(time.Duration(exp) * time.Second)
 			}
 		}
 
 		if token.AccessToken == "" {
 			return nil, fmt.Errorf("no access token in response: %s", string(body))
 		}
+
 		return &token, nil
+
 	case err := <-errChan:
-		server.Shutdown(context.Background())
 		return nil, err
+
 	case <-time.After(5 * time.Minute):
-		server.Shutdown(context.Background())
 		return nil, fmt.Errorf("OAuth timeout")
 	}
+}
+
+// ==========================
+// Token refresh (unchanged)
+// ==========================
+
+func MaybeRefreshToken(provider Provider, accountID string, token *models.Token) *models.Token {
+	tokenMutex.Lock()
+	defer tokenMutex.Unlock()
+
+	if token.Expiry.IsZero() || token.Expiry.After(time.Now().Add(5*time.Minute)) {
+		return token
+	}
+
+	if token.RefreshToken == "" {
+		return token
+	}
+
+	go refreshToken(provider, accountID, token.RefreshToken)
+	return token
+}
+
+func refreshToken(provider Provider, accountID string, refreshToken string) error {
+	params := url.Values{
+		"client_id":     {provider.ClientID},
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {refreshToken},
+	}
+
+	resp, err := http.PostForm(provider.TokenURL, params)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+
+	var newToken models.Token
+	if err := json.Unmarshal(body, &newToken); err != nil {
+		values, _ := url.ParseQuery(string(body))
+		newToken.AccessToken = values.Get("access_token")
+		newToken.RefreshToken = values.Get("refresh_token")
+		newToken.TokenType = values.Get("token_type")
+		if exp, _ := strconv.Atoi(values.Get("expires_in")); exp > 0 {
+			newToken.Expiry = time.Now().Add(time.Duration(exp) * time.Second)
+		}
+	}
+
+	return storage.StoreToken(accountID, &newToken)
+}
+
+// ==========================
+// Browser helper
+// ==========================
+
+func openBrowser(url string) error {
+	var cmd string
+	var args []string
+
+	switch runtime.GOOS {
+	case "windows":
+		cmd = "rundll32"
+		args = []string{"url.dll,FileProtocolHandler", url}
+	case "darwin":
+		cmd = "open"
+		args = []string{url}
+	case "linux":
+		cmd = "xdg-open"
+		args = []string{url}
+	default:
+		return fmt.Errorf("unsupported OS")
+	}
+
+	return exec.Command(cmd, args...).Start()
 }
 
 // FetchUserEmail gets user email from API
@@ -181,107 +306,4 @@ func FetchUserEmail(provider Provider, accessToken string) (string, error) {
 		email = login + "@github.com" // Placeholder
 	}
 	return email, nil
-}
-
-// MaybeRefreshToken handles refresh
-func MaybeRefreshToken(provider Provider, accountID string, token *models.Token) *models.Token {
-	tokenMutex.Lock()
-	defer tokenMutex.Unlock()
-
-	now := time.Now()
-	if token.Expiry.IsZero() {
-		return token // No expiry
-	}
-
-	margin := 5 * time.Minute
-	if token.Expiry.After(now.Add(margin)) {
-		return token // Good
-	}
-
-	if token.RefreshToken == "" {
-		return token // Can't refresh
-	}
-
-	if token.Expiry.After(now) {
-		// Near expiry, async refresh
-		go refreshToken(provider, accountID, token.RefreshToken)
-		return token
-	}
-
-	// Expired, sync refresh
-	err := refreshToken(provider, accountID, token.RefreshToken)
-	if err != nil {
-		// Log? But return old, Git will fail
-		return token
-	}
-
-	// Reload
-	newToken, _ := storage.GetToken(accountID)
-	return newToken
-}
-
-// refreshToken performs the refresh
-func refreshToken(provider Provider, accountID string, refreshToken string) error {
-	params := url.Values{
-		"client_id":     {provider.ClientID},
-		"grant_type":    {"refresh_token"},
-		"refresh_token": {refreshToken},
-	}
-
-	resp, err := http.PostForm(provider.TokenURL, params)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-
-	var newToken models.Token
-	err = json.Unmarshal(body, &newToken)
-	if err != nil {
-		values, _ := url.ParseQuery(string(body))
-		newToken.AccessToken = values.Get("access_token")
-		newToken.RefreshToken = values.Get("refresh_token")
-		newToken.TokenType = values.Get("token_type")
-		expiresIn, _ := strconv.Atoi(values.Get("expires_in"))
-		if expiresIn > 0 {
-			newToken.Expiry = time.Now().Add(time.Duration(expiresIn) * time.Second)
-		}
-	}
-
-	return storage.StoreToken(accountID, &newToken)
-}
-
-// Helper functions
-func generateRandomString(length int) string {
-	b := make([]byte, length)
-	rand.Read(b)
-	return base64.StdEncoding.EncodeToString(b)[:length]
-}
-
-func base64URLEncode(data [32]byte) string {
-	return base64.RawURLEncoding.EncodeToString(data[:])
-}
-
-func openBrowser(url string) error {
-	var cmd string
-	var args []string
-
-	switch runtime.GOOS {
-	case "windows":
-		cmd = "rundll32"
-		args = []string{"url.dll,FileProtocolHandler", url}
-	case "darwin":
-		cmd = "open"
-		args = []string{url}
-	case "linux":
-		cmd = "xdg-open"
-		args = []string{url}
-	default:
-		return fmt.Errorf("unsupported OS")
-	}
-
-	return exec.Command(cmd, args...).Start()
 }
